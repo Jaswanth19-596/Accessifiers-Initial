@@ -4,6 +4,8 @@ const cors = require('cors');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { chromium } = require('playwright');
+const { AxeBuilder } = require('@axe-core/playwright');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -363,10 +365,365 @@ app.post('/api/accessibility-insights', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
+// Helper function to calculate accessibility score
+const calculateAccessibilityScore = (results) => {
+  const { violations, passes } = results;
+  
+  // Weight violations by impact level
+  const impactWeights = {
+    critical: 10,
+    serious: 7,
+    moderate: 4,
+    minor: 1
+  };
+  
+  let totalDeductions = 0;
+  violations.forEach(violation => {
+    const weight = impactWeights[violation.impact] || 1;
+    totalDeductions += violation.nodes.length * weight;
+  });
+  
+  const totalPasses = passes.reduce((sum, pass) => sum + pass.nodes.length, 0);
+  const totalTests = totalPasses + violations.reduce((sum, v) => sum + v.nodes.length, 0);
+  
+  // Calculate score (0-100)
+  let score = 100;
+  if (totalTests > 0) {
+    score = Math.max(0, Math.round(100 - (totalDeductions / Math.max(totalTests, 1)) * 100));
+  }
+  
+  return {
+    score,
+    totalTests,
+    totalPasses,
+    totalViolations: violations.length,
+    totalNodes: violations.reduce((sum, v) => sum + v.nodes.length, 0)
+  };
+};
+
+app.post('/api/scan-accessibility', async (req, res) => {
+  const { 
+    url, 
+    tags = ['wcag2a', 'wcag2aa'], 
+    disableRules = [], 
+    include = null, 
+    exclude = null,
+    fastScan = false 
+  } = req.body;
+
+  if (!url) {
+    return res.status(400).json({
+      success: false,
+      error: 'URL is required'
+    });
+  }
+
+  try {
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    
+    // Set viewport for consistent results
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    
+    await page.goto(url, { waitUntil: 'networkidle' });
+
+    let axeBuilder = new AxeBuilder({ page })
+      .withTags(tags);
+
+    // Disable expensive rules for fast scanning
+    if (fastScan) {
+      axeBuilder = axeBuilder.disableRules(['color-contrast', 'duplicate-id']);
+    }
+
+    // Disable specific rules if requested
+    if (disableRules.length > 0) {
+      axeBuilder = axeBuilder.disableRules(disableRules);
+    }
+
+    // Apply include/exclude selectors
+    if (include) {
+      axeBuilder = axeBuilder.include(include);
+    }
+    if (exclude) {
+      axeBuilder = axeBuilder.exclude(exclude);
+    }
+
+    const results = await axeBuilder.analyze();
+    const scoreData = calculateAccessibilityScore(results);
+
+    await browser.close();
+
+    console.log(`Scan completed for ${url} - Score: ${scoreData.score}/100`);
+
+    res.json({
+      success: true,
+      accessibility: results,
+      score: scoreData,
+      scannedUrl: url,
+      timestamp: new Date().toISOString(),
+      scanOptions: {
+        tags,
+        disableRules,
+        include,
+        exclude,
+        fastScan
+      }
+    });
+  } catch (error) {
+    console.error('Scan error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      scannedUrl: url
+    });
+  }
+});
+
+// Get available axe-core rules and tags
+app.get('/api/rules', async (req, res) => {
+  try {
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    
+    // Get axe-core version and rules info
+    const axeInfo = await page.evaluate(async () => {
+      // Inject axe-core
+      const script = document.createElement('script');
+      script.src = 'https://unpkg.com/axe-core@latest/axe.min.js';
+      document.head.appendChild(script);
+      
+      await new Promise(resolve => {
+        script.onload = resolve;
+      });
+      
+      return {
+        version: window.axe.version,
+        rules: window.axe.getRules(),
+        tags: window.axe.getTags()
+      };
+    });
+
+    await browser.close();
+
+    res.json({
+      success: true,
+      axeCore: {
+        version: axeInfo.version,
+        totalRules: axeInfo.rules.length,
+        rules: axeInfo.rules.map(rule => ({
+          ruleId: rule.ruleId,
+          description: rule.description,
+          help: rule.help,
+          helpUrl: rule.helpUrl,
+          impact: rule.impact,
+          tags: rule.tags
+        })),
+        availableTags: axeInfo.tags
+      }
+    });
+  } catch (error) {
+    console.error('Rules endpoint error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Batch scan multiple URLs
+app.post('/api/scan-batch', async (req, res) => {
+  const { 
+    urls = [], 
+    tags = ['wcag2a', 'wcag2aa'], 
+    disableRules = [],
+    include = null,
+    exclude = null,
+    fastScan = false,
+    maxConcurrent = 3 
+  } = req.body;
+
+  if (!urls || !Array.isArray(urls) || urls.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'URLs array is required and must not be empty'
+    });
+  }
+
+  if (urls.length > 10) {
+    return res.status(400).json({
+      success: false,
+      error: 'Maximum 10 URLs allowed per batch'
+    });
+  }
+
+  try {
+    const results = [];
+    const errors = [];
+    
+    // Process URLs in batches to avoid overwhelming the system
+    for (let i = 0; i < urls.length; i += maxConcurrent) {
+      const batch = urls.slice(i, i + maxConcurrent);
+      
+      const batchPromises = batch.map(async (url) => {
+        try {
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
+          await page.setViewportSize({ width: 1920, height: 1080 });
+          await page.goto(url, { waitUntil: 'networkidle' });
+
+          let axeBuilder = new AxeBuilder({ page }).withTags(tags);
+
+          if (fastScan) {
+            axeBuilder = axeBuilder.disableRules(['color-contrast', 'duplicate-id']);
+          }
+          if (disableRules.length > 0) {
+            axeBuilder = axeBuilder.disableRules(disableRules);
+          }
+          if (include) {
+            axeBuilder = axeBuilder.include(include);
+          }
+          if (exclude) {
+            axeBuilder = axeBuilder.exclude(exclude);
+          }
+
+          const scanResults = await axeBuilder.analyze();
+          const scoreData = calculateAccessibilityScore(scanResults);
+
+          await browser.close();
+
+          return {
+            url,
+            success: true,
+            accessibility: scanResults,
+            score: scoreData,
+            timestamp: new Date().toISOString()
+          };
+        } catch (error) {
+          console.error(`Batch scan error for ${url}:`, error);
+          return {
+            url,
+            success: false,
+            error: error.message,
+            timestamp: new Date().toISOString()
+          };
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      
+      batchResults.forEach(result => {
+        if (result.success) {
+          results.push(result);
+        } else {
+          errors.push(result);
+        }
+      });
+    }
+
+    // Calculate batch summary
+    const totalScanned = results.length + errors.length;
+    const avgScore = results.length > 0 
+      ? Math.round(results.reduce((sum, r) => sum + r.score.score, 0) / results.length)
+      : 0;
+    
+    const totalViolations = results.reduce((sum, r) => sum + r.score.totalViolations, 0);
+
+    res.json({
+      success: true,
+      summary: {
+        totalUrls: urls.length,
+        successful: results.length,
+        failed: errors.length,
+        averageScore: avgScore,
+        totalViolations
+      },
+      results,
+      errors,
+      scanOptions: {
+        tags,
+        disableRules,
+        include,
+        exclude,
+        fastScan,
+        maxConcurrent
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Batch scan error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Health check endpoint
+app.get('/api/health', async (_req, res) => {
+  try {
+    // Test basic browser functionality
+    const startTime = Date.now();
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.goto('data:text/html,<html><body>Health Check</body></html>');
+    await browser.close();
+    const browserTestTime = Date.now() - startTime;
+
+    res.json({
+      success: true,
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB',
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + ' MB'
+      },
+      browserTest: {
+        success: true,
+        responseTime: browserTestTime + 'ms'
+      },
+      version: '1.0.0'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+app.get('/', (_req, res) => {
   res.json({
-    message: 'Accessibility Insights API Server',
-    endpoints: ['POST /api/accessibility-insights - Run accessibility scan'],
+    message: 'Enhanced Accessibility Scanner API Server',
+    version: '2.0.0',
+    features: [
+      'Direct axe-core integration with Playwright',
+      'Real-time accessibility scoring (0-100)',
+      'Configurable WCAG tags and rule sets',
+      'Fast scan mode for performance',
+      'Batch scanning up to 10 URLs',
+      'Include/exclude CSS selectors'
+    ],
+    endpoints: [
+      'GET /api/health - Service health check',
+      'GET /api/rules - List available axe-core rules and tags',
+      'POST /api/scan-accessibility - Run single URL accessibility scan',
+      'POST /api/scan-batch - Run batch accessibility scan (up to 10 URLs)',
+      'POST /api/accessibility-insights - Legacy endpoint (deprecated)'
+    ],
+    documentation: {
+      scanOptions: {
+        url: 'Required - URL to scan',
+        tags: 'Array of WCAG tags (default: [wcag2a, wcag2aa])',
+        disableRules: 'Array of rule IDs to disable',
+        include: 'CSS selector to include specific elements',
+        exclude: 'CSS selector to exclude specific elements',
+        fastScan: 'Boolean - disable expensive rules for faster scanning'
+      }
+    }
   });
 });
 
@@ -379,9 +736,10 @@ app.use((error, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Accessibility Insights API server running on port ${PORT}`);
+  console.log(`🚀 Enhanced Accessibility Scanner API server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
-  console.log(
-    `🔍 Scan endpoint: POST http://localhost:${PORT}/api/accessibility-insights`
-  );
+  console.log(`📋 API docs: http://localhost:${PORT}/`);
+  console.log(`🔍 Main scan endpoint: POST http://localhost:${PORT}/api/scan-accessibility`);
+  console.log(`📦 Batch scan endpoint: POST http://localhost:${PORT}/api/scan-batch`);
+  console.log(`⚙️  Rules endpoint: GET http://localhost:${PORT}/api/rules`);
 });

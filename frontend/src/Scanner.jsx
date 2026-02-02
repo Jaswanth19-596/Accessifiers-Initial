@@ -59,7 +59,7 @@ const Scanner = () => {
   // Accessibility Insights API call (to your backend)
   const callAccessibilityInsights = async (testUrl) => {
     try {
-      const response = await fetch(`${backendUrl}/api/accessibility-insights`, {
+      const response = await fetch(`${backendUrl}/api/scan-accessibility`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -73,7 +73,25 @@ const Scanner = () => {
         );
       }
 
-      return await response.json();
+      const data = await response.json();
+      
+      // Transform new API response to match expected format
+      if (data.success && data.accessibility) {
+        return {
+          summary: {
+            violations: data.accessibility.violations?.length || 0,
+            passes: data.accessibility.passes?.length || 0,
+            incomplete: data.accessibility.incomplete?.length || 0,
+            inapplicable: data.accessibility.inapplicable?.length || 0,
+          },
+          violations: data.accessibility.violations || [],
+          passes: data.accessibility.passes || [],
+          url: data.scannedUrl,
+          timestamp: data.timestamp,
+        };
+      }
+      
+      return data;
     } catch (error) {
       console.error('Accessibility Insights Error:', error);
       throw error;
