@@ -1,0 +1,29 @@
+{
+  "scans": [
+    {
+      "id": "90c25cad-d62e-452a-b6d2-15b36352abbd",
+      "productId": "accessifiers-demo",
+      "scannedUrl": "https://example.com",
+      "submittedByUserId": "anonymous",
+      "source": "https://example.com",
+      "toolName": "axe-core",
+      "toolVersion": "4.10.3",
+      "wcagLevel": "AA",
+      "score": 100,
+      "reportUrl": null,
+      "createdAt": "2026-03-02T21:07:56.221Z",
+      "reportSummary": {
+        "totalViolations": 0,
+        "totalPasses": 7,
+        "totalIncomplete": 0,
+        "totalInapplicable": 51,
+        "totalNodes": 0,
+        "criticalCount": 0,
+        "seriousCount": 0,
+        "moderateCount": 0,
+        "minorCount": 0
+      },
+      "reportNavigation": []
+    }
+  ]
+}

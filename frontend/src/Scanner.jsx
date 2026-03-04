@@ -1,60 +1,13 @@
 import React, { useState } from 'react';
-import {
-  AlertCircle,
-  Clock,
-  ExternalLink,
-  Zap,
-  Eye,
-  Monitor,
-  AlertTriangle,
-  Settings,
-} from 'lucide-react';
 
 const Scanner = () => {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [error, setError] = useState('');
-  const [waveApiKey, setWaveApiKey] = useState('SmKMiuBU5751');
-  const [backendUrl, setBackendUrl] = useState('http://localhost:3001');
+  const [backendUrl, setBackendUrl] = useState(process.env.REACT_APP_BACKEND_URL || 'http://localhost:3001');
   const [showSettings, setShowSettings] = useState(false);
 
-  // WAVE API call
-  const callWaveAPI = async (testUrl, apiKey) => {
-    // Replace {testUrl} with the actual URL
-    const waveUrl = `https://wave.webaim.org/api/request?key=${apiKey}&reporttype=2&url=${encodeURIComponent(
-      testUrl
-    )}`;
-
-    try {
-      const response = await fetch(waveUrl);
-      if (!response.ok) {
-        if (response.status === 400) {
-          throw new Error('Invalid URL or API key for WAVE API');
-        }
-        throw new Error(
-          `WAVE API error: ${response.status} ${response.statusText}`
-        );
-      }
-
-      const data = await response.json();
-
-      // Handle WAVE API error responses
-      if (data.status && !data.status.success) {
-        throw new Error(`WAVE API: ${data.status.error || 'Unknown error'}`);
-      }
-
-      // Return the full response including statistics & categories
-      return {
-        status: data.status,
-        statistics: data.statistics,
-        categories: data.categories,
-      };
-    } catch (error) {
-      console.error('WAVE API Error:', error);
-      throw error;
-    }
-  };
 
   // Accessibility Insights API call (to your backend)
   const callAccessibilityInsights = async (testUrl) => {
@@ -67,15 +20,13 @@ const Scanner = () => {
         body: JSON.stringify({ url: testUrl }),
       });
 
-      if (!response.ok) {
-        throw new Error(
-          `Accessibility Insights API error: ${response.status} ${response.statusText}`
-        );
-      }
-
       const data = await response.json();
       
-      // Transform new API response to match expected format
+      // Handle error responses with user-friendly messages
+      if (!response.ok) {
+        throw new Error(data.error || `Accessibility Insights API error: ${response.status} ${response.statusText}`);
+      }
+      
       if (data.success && data.accessibility) {
         return {
           summary: {
@@ -86,9 +37,17 @@ const Scanner = () => {
           },
           violations: data.accessibility.violations || [],
           passes: data.accessibility.passes || [],
+          incomplete: data.accessibility.incomplete || [],
+          inapplicable: data.accessibility.inapplicable || [],
           url: data.scannedUrl,
           timestamp: data.timestamp,
+          score: data.score
         };
+      }
+      
+      // If not successful, throw with the error message
+      if (!data.success) {
+        throw new Error(data.error || 'Scan failed');
       }
       
       return data;
@@ -106,7 +65,6 @@ const Scanner = () => {
       return;
     }
 
-    // Basic URL validation
     const urlPattern = /^https?:\/\/.+/i;
     if (!urlPattern.test(url)) {
       setError('Please enter a valid URL starting with http:// or https://');
@@ -118,43 +76,28 @@ const Scanner = () => {
     setResults(null);
 
     try {
-      console.log('Starting scans for:', url);
+      console.log('Starting scan for:', url);
 
-      // Run both scans in parallel
-      const [waveResults, insightsResults] = await Promise.allSettled([
-        callWaveAPI(url, waveApiKey),
-        callAccessibilityInsights(url),
-      ]);
+      try {
+        const insightsResults = await callAccessibilityInsights(url);
 
-      // Process results
-      const finalResults = {
-        url: url,
-        timestamp: new Date().toISOString(),
-        wave: null,
-        insights: null,
-        waveError: null,
-        insightsError: null,
-      };
+        const finalResults = {
+          url: url,
+          timestamp: new Date().toISOString(),
+          insights: insightsResults,
+          insightsError: null,
+        };
 
-      if (waveResults.status === 'fulfilled') {
-        finalResults.wave = waveResults.value;
-      } else {
-        finalResults.waveError = waveResults.reason.message;
-      }
-
-      if (insightsResults.status === 'fulfilled') {
-        finalResults.insights = insightsResults.value;
-      } else {
-        finalResults.insightsError = insightsResults.reason.message;
-      }
-
-      setResults(finalResults);
-
-      // Show error if both failed
-      if (!finalResults.wave && !finalResults.insights) {
-        setError(
-          'Both scans failed. Please check your settings and try again.'
-        );
+        setResults(finalResults);
+      } catch (innerErr) {
+        const finalResults = {
+          url: url,
+          timestamp: new Date().toISOString(),
+          insights: null,
+          insightsError: innerErr.message,
+        };
+        setResults(finalResults);
+        setError('Scan failed. Please check your settings and try again.');
       }
     } catch (err) {
       setError('Failed to scan the website. Please try again.');
@@ -179,35 +122,64 @@ const Scanner = () => {
     }
   };
 
-  const getOverallScore = () => {
-    if (!results) return 0;
+  // Calculate comprehensive weighted accessibility score
+  const calculateAccessibilityScore = () => {
+    if (!results || !results.insights || !results.insights.score) return { score: 0, breakdown: null };
 
-    let totalIssues = 0;
-    let totalElements = 100; // Default fallback
+    // Severity weights - higher = more impact on score
+    const backendScore = results.insights.score.score;
 
-    // Count WAVE errors
-    if (results.wave?.categories) {
-      totalIssues += results.wave.categories.error?.count || 0;
-      totalElements = results.wave.statistics?.totalelements || totalElements;
+    let breakdown = {
+      axeCritical: 0,
+      axeSerious: 0,
+      axeModerate: 0,
+      axeMinor: 0,
+      totalViolations: 0,
+      totalPasses: 0
+    };
+
+    // Process Accessibility Insights (axe-core) results
+    if (results.insights?.violations) {
+      results.insights.violations.forEach(violation => {
+        const nodeCount = violation.nodes?.length || 1;
+        
+        switch (violation.impact) {
+          case 'critical':
+            breakdown.axeCritical += nodeCount;
+            break;
+          case 'serious':
+            breakdown.axeSerious += nodeCount;
+            break;
+          case 'moderate':
+            breakdown.axeModerate += nodeCount;
+            break;
+          default:
+            breakdown.axeMinor += nodeCount;
+        }
+      });
+
+      breakdown.totalViolations = results.insights.summary?.violations || 0;
+      breakdown.totalPasses = results.insights.summary?.passes || 0;
     }
 
-    // Count Insights violations
-    if (results.insights?.summary) {
-      totalIssues += results.insights.summary.violations || 0;
-    }
-
-    const score = Math.max(
-      0,
-      Math.round((1 - totalIssues / Math.max(totalElements, 10)) * 100)
-    );
-    return Math.min(100, score);
+    return { score: backendScore, breakdown };
   };
 
   const getScoreColor = (score) => {
-    if (score >= 90) return 'text-green-600';
-    if (score >= 70) return 'text-yellow-600';
-    return 'text-red-600';
+    if (score >= 90) return 'text-green-600 bg-green-50 border-green-500';
+    if (score >= 70) return 'text-yellow-600 bg-yellow-50 border-yellow-500';
+    if (score >= 50) return 'text-orange-600 bg-orange-50 border-orange-500';
+    return 'text-red-600 bg-red-50 border-red-500';
   };
+
+  const getScoreLabel = (score) => {
+    if (score >= 90) return 'Excellent';
+    if (score >= 70) return 'Good';
+    if (score >= 50) return 'Needs Improvement';
+    return 'Poor';
+  };
+
+  const { score: accessibilityScore, breakdown: scoreBreakdown } = calculateAccessibilityScore();
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
@@ -218,8 +190,7 @@ const Scanner = () => {
             Accessibility Scanner
           </h1>
           <p className="text-xl text-gray-600 mb-2">
-            Real-time accessibility analysis using WAVE API & Accessibility
-            Insights
+            Real-time accessibility analysis using Accessibility Insights (Axe-core)
           </p>
           <p className="text-sm text-gray-500">
             Built for the Accessibility Ratings Project
@@ -232,7 +203,6 @@ const Scanner = () => {
             onClick={() => setShowSettings(!showSettings)}
             className="inline-flex items-center px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500"
           >
-            <Settings className="w-4 h-4 mr-2" />
             {showSettings ? 'Hide Settings' : 'Show Settings'}
           </button>
         </div>
@@ -260,8 +230,7 @@ const Scanner = () => {
                   className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                 />
                 <p className="text-xs text-gray-500 mt-1">
-                  URL of your Node.js backend running
-                  accessibility-insights-scan
+                  URL of your Node.js backend running accessibility-insights-scan
                 </p>
               </div>
             </div>
@@ -297,27 +266,14 @@ const Scanner = () => {
                 disabled={loading || !url}
                 className="w-full sm:w-auto px-8 py-3 bg-indigo-600 text-white font-medium rounded-md shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200"
               >
-                {loading ? (
-                  <div className="flex items-center">
-                    <Clock className="animate-spin w-4 h-4 mr-2" />
-                    Scanning...
-                  </div>
-                ) : (
-                  <div className="flex items-center">
-                    <Zap className="w-4 h-4 mr-2" />
-                    Scan Website
-                  </div>
-                )}
+                {loading ? 'Scanning...' : 'Scan Website'}
               </button>
             </div>
           </form>
 
           {error && (
             <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-md">
-              <div className="flex items-center">
-                <AlertCircle className="w-5 h-5 text-red-500 mr-2" />
-                <span className="text-red-700">{error}</span>
-              </div>
+              <span className="text-red-700">{error}</span>
             </div>
           )}
         </div>
@@ -325,13 +281,12 @@ const Scanner = () => {
         {/* Loading State */}
         {loading && (
           <div className="bg-white rounded-lg shadow-lg p-8 text-center">
-            <Clock className="w-12 h-12 animate-spin text-indigo-600 mx-auto mb-4" />
+            <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
             <h3 className="text-lg font-medium text-gray-900 mb-2">
               Scanning Website...
             </h3>
             <p className="text-gray-600">
-              Running WAVE API and Accessibility Insights analysis. This may
-              take a few moments.
+              Running Accessibility Insights analysis. This may take a few moments.
             </p>
           </div>
         )}
@@ -339,151 +294,79 @@ const Scanner = () => {
         {/* Results */}
         {results && (
           <div className="space-y-8">
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-              {/* WAVE Results */}
-              <div className="bg-white rounded-lg shadow-lg">
-                <div className="p-6 border-b border-gray-200">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center">
-                      <Eye className="w-6 h-6 text-blue-600 mr-3" />
-                      <h3 className="text-xl font-bold text-gray-900">
-                        WAVE Analysis
-                      </h3>
-                    </div>
-                    {results.wave && (
-                      <span className="text-sm text-gray-500">
-                        {results.wave.statistics?.time?.toFixed(2)}s
-                      </span>
-                    )}
-                  </div>
+            {/* Overall Accessibility Score */}
+            <div className={`bg-white rounded-lg shadow-lg p-8 border-l-4 ${getScoreColor(accessibilityScore)}`}>
+              <div className="flex flex-col md:flex-row items-center justify-between">
+                <div className="text-center md:text-left mb-4 md:mb-0">
+                  <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                    Accessibility Score
+                  </h2>
+                  <p className="text-gray-600">
+                    Accessibility score from Accessibility Insights analysis
+                  </p>
                 </div>
-
-                <div className="p-6">
-                  {results.waveError ? (
-                    <div className="text-center py-8">
-                      <AlertTriangle className="w-12 h-12 text-red-500 mx-auto mb-4" />
-                      <h4 className="text-lg font-medium text-gray-900 mb-2">
-                        WAVE Scan Failed
-                      </h4>
-                      <p className="text-red-600 text-sm">
-                        {results.waveError}
-                      </p>
-                    </div>
-                  ) : results.wave ? (
-                    <div className="space-y-4">
-                      {/* WAVE Statistics */}
-                      {results.wave.statistics && (
-                        <div className="grid grid-cols-2 gap-4 text-sm">
-                          <div>
-                            <span className="text-gray-500">
-                              Total Elements:
-                            </span>
-                            <span className="ml-2 font-medium">
-                              {results.wave.statistics.totalelements}
-                            </span>
-                          </div>
-                          <div>
-                            <span className="text-gray-500">
-                              Credits Remaining:
-                            </span>
-                            <span className="ml-2 font-medium">
-                              {results.wave.statistics.creditsremaining}
-                            </span>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* WAVE Categories */}
-                      {results.wave.categories && (
-                        <div className="space-y-3">
-                          {Object.entries(results.wave.categories).map(
-                            ([category, data]) => (
-                              <div
-                                key={category}
-                                className="border border-gray-200 rounded-md p-4"
-                              >
-                                <div className="flex items-center justify-between mb-2">
-                                  <h4 className="font-medium text-gray-900 capitalize">
-                                    {category === 'error' && '🚨 '}
-                                    {category === 'alert' && '⚠️ '}
-                                    {category === 'feature' && '✅ '}
-                                    {category}s
-                                  </h4>
-                                  <span
-                                    className={`px-2 py-1 rounded-full text-xs font-medium ${
-                                      category === 'error'
-                                        ? 'bg-red-100 text-red-800'
-                                        : category === 'alert'
-                                        ? 'bg-yellow-100 text-yellow-800'
-                                        : 'bg-green-100 text-green-800'
-                                    }`}
-                                  >
-                                    {data.count}
-                                  </span>
-                                </div>
-                                {data.items &&
-                                  Object.keys(data.items).length > 0 && (
-                                    <div className="text-sm text-gray-600 space-y-1">
-                                      {Object.entries(data.items)
-                                        .slice(0, 3)
-                                        .map(([itemId, item]) => (
-                                          <div
-                                            key={itemId}
-                                            className="flex justify-between"
-                                          >
-                                            <span>{item.description}</span>
-                                            <span className="font-medium">
-                                              {item.count}
-                                            </span>
-                                          </div>
-                                        ))}
-                                      {Object.keys(data.items).length > 3 && (
-                                        <div className="text-gray-500 italic">
-                                          +{Object.keys(data.items).length - 3}{' '}
-                                          more...
-                                        </div>
-                                      )}
-                                    </div>
-                                  )}
-                              </div>
-                            )
-                          )}
-                        </div>
-                      )}
-
-                      {/* {results.wave.statistics?.waveurl && (
-                        <div className="pt-4 border-t border-gray-200">
-                          <a
-                            href={results.wave.statistics.waveurl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center text-sm text-indigo-600 hover:text-indigo-500"
-                          >
-                            <ExternalLink className="w-4 h-4 mr-1" />
-                            View Full WAVE Report
-                          </a>
-                        </div>
-                      )} */}
-                    </div>
-                  ) : null}
+                <div className="text-center">
+                  <div className={`text-6xl font-bold ${getScoreColor(accessibilityScore).split(' ')[0]}`}>
+                    {accessibilityScore}
+                  </div>
+                  <div className={`text-lg font-medium ${getScoreColor(accessibilityScore).split(' ')[0]}`}>
+                    {getScoreLabel(accessibilityScore)}
+                  </div>
                 </div>
               </div>
 
+              {/* Score Breakdown */}
+              {scoreBreakdown && (
+                <div className="mt-6 pt-6 border-t border-gray-200">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-4">Score Breakdown</h3>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                    <div className="bg-red-50 p-3 rounded">
+                      <div className="font-medium text-red-800">Critical Issues</div>
+                      <div className="text-2xl font-bold text-red-600">
+                        {scoreBreakdown.axeCritical}
+                      </div>
+                    </div>
+                    <div className="bg-orange-50 p-3 rounded">
+                      <div className="font-medium text-orange-800">Serious Issues</div>
+                      <div className="text-2xl font-bold text-orange-600">
+                        {scoreBreakdown.axeSerious}
+                      </div>
+                    </div>
+                    <div className="bg-yellow-50 p-3 rounded">
+                      <div className="font-medium text-yellow-800">Moderate Issues</div>
+                      <div className="text-2xl font-bold text-yellow-600">
+                        {scoreBreakdown.axeModerate}
+                      </div>
+                    </div>
+                    <div className="bg-blue-50 p-3 rounded">
+                      <div className="font-medium text-blue-800">Minor Issues</div>
+                      <div className="text-2xl font-bold text-blue-600">
+                        {scoreBreakdown.axeMinor}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-4 flex gap-4 text-sm">
+                    <div className="bg-green-50 p-2 px-4 rounded">
+                      <span className="text-green-800 font-medium">Passed Checks: </span>
+                      <span className="text-green-600 font-bold">{scoreBreakdown.totalPasses}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-8">
               {/* Accessibility Insights Results */}
               <div className="bg-white rounded-lg shadow-lg">
                 <div className="p-6 border-b border-gray-200">
-                  <div className="flex items-center">
-                    <Monitor className="w-6 h-6 text-green-600 mr-3" />
-                    <h3 className="text-xl font-bold text-gray-900">
-                      Accessibility Insights
-                    </h3>
-                  </div>
+                  <h3 className="text-xl font-bold text-gray-900">
+                    Accessibility Insights
+                  </h3>
                 </div>
 
                 <div className="p-6">
                   {results.insightsError ? (
                     <div className="text-center py-8">
-                      <AlertTriangle className="w-12 h-12 text-red-500 mx-auto mb-4" />
                       <h4 className="text-lg font-medium text-gray-900 mb-2">
                         Insights Scan Failed
                       </h4>
@@ -495,14 +378,9 @@ const Scanner = () => {
                           Backend Setup Required:
                         </p>
                         <ol className="text-xs text-blue-700 space-y-1 list-decimal list-inside">
-                          <li>
-                            Install:{' '}
-                            <code className="bg-blue-100 px-1 rounded">
-                              npm install accessibility-insights-scan
-                            </code>
-                          </li>
-                          <li>Create a Node.js server with the endpoint</li>
-                          <li>Update the backend URL in settings</li>
+                          <li>Install: <code className="bg-blue-100 px-1 rounded">npm install</code></li>
+                          <li>Run: <code className="bg-blue-100 px-1 rounded">npx playwright install</code></li>
+                          <li>Start: <code className="bg-blue-100 px-1 rounded">node server.js</code></li>
                         </ol>
                       </div>
                     </div>
@@ -538,58 +416,135 @@ const Scanner = () => {
                         </div>
                       )}
 
-                      {/* Violations */}
+                      {/* Violations Section */}
                       {results.insights.violations &&
                         results.insights.violations.length > 0 && (
-                          <div className="space-y-3">
-                            <h4 className="font-medium text-gray-900">
-                              Top Violations:
+                          <div className="space-y-3 mt-4">
+                            <h4 className="font-medium text-gray-900 text-lg border-b pb-2">
+                              Violations ({results.insights.violations.length})
                             </h4>
-                            {results.insights.violations
-                              .slice(0, 5)
-                              .map((violation, index) => (
-                                <div
+                            <div className="max-h-96 overflow-y-auto space-y-3">
+                              {results.insights.violations.map((violation, index) => (
+                                <details
                                   key={index}
-                                  className={`border rounded-md p-3 ${getSeverityColor(
-                                    violation.impact
-                                  )}`}
+                                  className={`border rounded-md ${getSeverityColor(violation.impact)}`}
                                 >
-                                  <div className="flex items-start justify-between mb-2">
-                                    <h5 className="font-medium text-sm">
-                                      {violation.description}
-                                    </h5>
-                                    <span className="text-xs px-2 py-1 rounded-full bg-white bg-opacity-50">
-                                      {violation.impact}
-                                    </span>
-                                  </div>
-                                  {violation.nodes &&
-                                    violation.nodes.length > 0 && (
-                                      <div className="text-xs opacity-75">
-                                        Affects {violation.nodes.length} element
-                                        {violation.nodes.length !== 1
-                                          ? 's'
-                                          : ''}
+                                  <summary className="p-3 cursor-pointer">
+                                    <div className="inline-flex items-center justify-between w-full">
+                                      <span className="font-medium text-sm">
+                                        {violation.id}: {violation.description}
+                                      </span>
+                                      <span className="text-xs px-2 py-1 rounded-full bg-white bg-opacity-50 ml-2">
+                                        {violation.impact} - {violation.nodes?.length || 0} element(s)
+                                      </span>
+                                    </div>
+                                  </summary>
+                                  <div className="p-3 pt-0 space-y-2">
+                                    {violation.help && (
+                                      <a
+                                        href={violation.help}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center text-xs text-blue-600 hover:underline"
+                                      >
+                                        Learn how to fix
+                                      </a>
+                                    )}
+                                    {violation.nodes && violation.nodes.length > 0 && (
+                                      <div className="space-y-2">
+                                        <p className="text-xs font-medium text-gray-700">Affected Elements:</p>
+                                        {violation.nodes.slice(0, 10).map((node, nodeIndex) => (
+                                          <div
+                                            key={nodeIndex}
+                                            className="bg-white bg-opacity-50 rounded p-2 text-xs"
+                                          >
+                                            <div className="font-mono text-gray-600 mb-1">
+                                              {node.target?.join(' > ') || 'Unknown selector'}
+                                            </div>
+                                            {node.html && (
+                                              <pre className="bg-gray-800 text-green-400 p-2 rounded text-xs overflow-x-auto max-w-full">
+                                                {node.html}
+                                              </pre>
+                                            )}
+                                            {node.failureSummary && (
+                                              <p className="text-red-700 mt-1 text-xs">
+                                                {node.failureSummary}
+                                              </p>
+                                            )}
+                                          </div>
+                                        ))}
+                                        {violation.nodes.length > 10 && (
+                                          <p className="text-xs text-gray-500 italic">
+                                            +{violation.nodes.length - 10} more elements...
+                                          </p>
+                                        )}
                                       </div>
                                     )}
-                                  {violation.help && (
-                                    <a
-                                      href={violation.help}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="inline-flex items-center text-xs mt-2 opacity-75 hover:opacity-100"
-                                    >
-                                      <ExternalLink className="w-3 h-3 mr-1" />
-                                      Learn more
-                                    </a>
-                                  )}
-                                </div>
+                                  </div>
+                                </details>
                               ))}
-                            {results.insights.violations.length > 5 && (
-                              <p className="text-sm text-gray-500 italic">
-                                +{results.insights.violations.length - 5} more
-                                violations...
-                              </p>
-                            )}
+                            </div>
+                          </div>
+                        )}
+
+                      {/* Incomplete Section */}
+                      {results.insights.incomplete &&
+                        results.insights.incomplete.length > 0 && (
+                          <div className="space-y-3 mt-4">
+                            <h4 className="font-medium text-gray-900 text-lg border-b pb-2">
+                              Needs Review ({results.insights.incomplete.length})
+                            </h4>
+                            <div className="max-h-64 overflow-y-auto space-y-2">
+                              {results.insights.incomplete.map((item, index) => (
+                                <details
+                                  key={index}
+                                  className="border border-yellow-200 bg-yellow-50 rounded-md"
+                                >
+                                  <summary className="p-3 cursor-pointer">
+                                    <span className="font-medium text-sm text-yellow-800">
+                                      {item.id}: {item.description}
+                                    </span>
+                                    <span className="text-xs ml-2 text-yellow-600">
+                                      ({item.nodes?.length || 0} element(s))
+                                    </span>
+                                  </summary>
+                                  <div className="p-3 pt-0">
+                                    {item.nodes && item.nodes.slice(0, 5).map((node, nodeIndex) => (
+                                      <div key={nodeIndex} className="bg-white rounded p-2 text-xs mb-1">
+                                        <div className="font-mono text-gray-600">
+                                          {node.target?.join(' > ')}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </details>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                      {/* Passes Section */}
+                      {results.insights.passes &&
+                        results.insights.passes.length > 0 && (
+                          <div className="space-y-3 mt-4">
+                            <details>
+                              <summary className="font-medium text-gray-900 text-lg border-b pb-2 cursor-pointer">
+                                Passed Rules ({results.insights.passes.length})
+                              </summary>
+                              <div className="max-h-48 overflow-y-auto mt-2 space-y-1">
+                                {results.insights.passes.map((pass, index) => (
+                                  <div
+                                    key={index}
+                                    className="flex justify-between items-center p-2 bg-green-50 rounded text-sm"
+                                  >
+                                    <span className="text-green-800">{pass.id}</span>
+                                    <span className="text-xs text-green-600">
+                                      {pass.nodes?.length || pass.nodes || 0} element(s)
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
                           </div>
                         )}
                     </div>

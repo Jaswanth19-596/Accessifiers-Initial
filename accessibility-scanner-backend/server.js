@@ -1,4 +1,5 @@
 // server.js - Node.js backend for Accessibility Insights integration
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { execFile } = require('child_process');
@@ -27,6 +28,91 @@ const tempDir = path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) {
   fs.mkdirSync(tempDir);
 }
+
+// Database initialisation
+const DB_FILE = path.join(__dirname, 'database.json');
+if (!fs.existsSync(DB_FILE)) {
+  fs.writeFileSync(DB_FILE, JSON.stringify({ scans: [] }, null, 2));
+}
+
+// Helper to save scan data to local database.json
+const saveToDatabase = (url, results, scoreData, options = {}) => {
+  try {
+    const dbData = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+
+    // --- Severity breakdown counts ---
+    const severityCounts = { criticalCount: 0, seriousCount: 0, moderateCount: 0, minorCount: 0 };
+    if (results && results.violations) {
+      results.violations.forEach(violation => {
+        const nodeCount = violation.nodes ? violation.nodes.length : 0;
+        switch (violation.impact) {
+          case 'critical':  severityCounts.criticalCount  += nodeCount; break;
+          case 'serious':   severityCounts.seriousCount   += nodeCount; break;
+          case 'moderate':  severityCounts.moderateCount  += nodeCount; break;
+          default:          severityCounts.minorCount     += nodeCount; break;
+        }
+      });
+    }
+
+    // --- Build the record ---
+    const newRecord = {
+      id: require('crypto').randomUUID(),
+      productId: options.productId || 'accessifiers-demo',
+      scannedUrl: url,
+      submittedByUserId: options.submittedByUserId || 'anonymous', // Extend when auth is added
+      source: url,                                                  // Using URL as source identifier
+      toolName: 'axe-core',
+      toolVersion: results?.testEngine?.version || 'unknown',
+      wcagLevel: options.wcagLevel || 'AA',                         // Default; LLM classification later
+      score: scoreData.score,
+      reportUrl: options.reportUrl || null,                         // For future blob storage link
+      createdAt: new Date().toISOString(),
+      reportSummary: {
+        totalViolations: scoreData.totalViolations,
+        totalPasses: scoreData.totalPasses,
+        totalIncomplete: results?.incomplete?.length || 0,
+        totalInapplicable: results?.inapplicable?.length || 0,
+        totalNodes: scoreData.totalNodes,
+        ...severityCounts
+      },
+      reportNavigation: []
+    };
+
+    // --- Flatten violations into reportNavigation ---
+    if (results && results.violations) {
+      results.violations.forEach(violation => {
+        if (violation.nodes && violation.nodes.length > 0) {
+          violation.nodes.forEach(node => {
+            newRecord.reportNavigation.push({
+              ruleId: violation.id,
+              impact: violation.impact,
+              // WCAG criteria tags from axe-core (e.g. ['wcag2a', 'wcag411'])
+              wcagCriteria: (violation.tags || []).filter(tag =>
+                tag.startsWith('wcag') || tag.startsWith('best-practice')
+              ),
+              description: violation.description,
+              helpUrl: violation.helpUrl || '',
+              elementSelector: node.target ? node.target.join(' > ') : 'Unknown',
+              elementHtml: (node.html || '').substring(0, 300),
+              failureSummary: node.failureSummary || ''
+            });
+          });
+        }
+      });
+    }
+
+    // --- Persist ---
+    dbData.scans.push(newRecord);
+    fs.writeFileSync(DB_FILE, JSON.stringify(dbData, null, 2));
+
+    console.log(`Scan saved [${newRecord.id}] — Score: ${newRecord.score}, Violations: ${newRecord.reportSummary.totalViolations}, Tool: ${newRecord.toolName}@${newRecord.toolVersion}`);
+    return newRecord;
+
+  } catch (error) {
+    console.error('Error saving to database:', error);
+    return null;
+  }
+};
 
 // Accessibility Insights scan endpoint
 app.post('/api/accessibility-insights', async (req, res) => {
@@ -346,6 +432,17 @@ app.post('/api/accessibility-insights', async (req, res) => {
         })) || [],
     };
 
+    // Calculate a mock score for the legacy endpoint so saveToDatabase doesn't fail
+    const mockScoreData = {
+      score: 0,
+      totalViolations: processedResults.summary.violations,
+      totalPasses: processedResults.summary.passes,
+      totalNodes: 0
+    };
+
+    // Save to Local DB (legacy endpoint)
+    saveToDatabase(parsedUrl.href, jsonReport, mockScoreData, { productId: 'accessifiers-legacy' });
+
     setTimeout(() => {
       try {
         fs.rmSync(reportDir, { recursive: true, force: true });
@@ -418,14 +515,89 @@ app.post('/api/scan-accessibility', async (req, res) => {
     });
   }
 
+  let browser = null;
+  
   try {
-    const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      // Add user agent to avoid being blocked by some sites
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    });
+    const page = await context.newPage();
     
     // Set viewport for consistent results
     await page.setViewportSize({ width: 1920, height: 1080 });
     
-    await page.goto(url, { waitUntil: 'networkidle' });
+    // Try to load the page with fallback strategies
+    let pageLoaded = false;
+    let loadError = null;
+    
+    // First try: networkidle with extended timeout
+    try {
+      await page.goto(url, { 
+        waitUntil: 'networkidle',
+        timeout: 45000 // 45 seconds
+      });
+      pageLoaded = true;
+    } catch (e) {
+      console.log(`networkidle failed for ${url}, trying domcontentloaded...`);
+      loadError = e;
+    }
+    
+    // Fallback: try domcontentloaded (faster, works for most SPAs)
+    if (!pageLoaded) {
+      try {
+        await page.goto(url, { 
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+        // Wait a bit for JavaScript to run
+        await page.waitForTimeout(3000);
+        pageLoaded = true;
+      } catch (e) {
+        console.log(`domcontentloaded also failed for ${url}`);
+        loadError = e;
+      }
+    }
+    
+    // Final fallback: just load whatever we can
+    if (!pageLoaded) {
+      try {
+        await page.goto(url, { 
+          waitUntil: 'commit',
+          timeout: 20000
+        });
+        await page.waitForTimeout(5000);
+        pageLoaded = true;
+      } catch (e) {
+        loadError = e;
+      }
+    }
+    
+    if (!pageLoaded) {
+      await browser.close();
+      
+      // Provide user-friendly error messages
+      let userMessage = 'Unable to load the website for scanning.';
+      
+      if (loadError?.message?.includes('Timeout')) {
+        userMessage = 'The website took too long to respond. This could be because:\n• The website is too complex or slow\n• The website blocks automated access\n• Network connectivity issues';
+      } else if (loadError?.message?.includes('net::ERR_NAME_NOT_RESOLVED')) {
+        userMessage = 'The website domain could not be found. Please check the URL is correct.';
+      } else if (loadError?.message?.includes('net::ERR_CONNECTION_REFUSED')) {
+        userMessage = 'Connection was refused by the website server.';
+      } else if (loadError?.message?.includes('net::ERR_SSL')) {
+        userMessage = 'SSL/HTTPS certificate error. The website may have security issues.';
+      }
+      
+      return res.status(408).json({
+        success: false,
+        error: userMessage,
+        technicalError: loadError?.message || 'Unknown error',
+        scannedUrl: url,
+        suggestion: 'Try scanning a different website or check if the URL is accessible in your browser.'
+      });
+    }
 
     let axeBuilder = new AxeBuilder({ page })
       .withTags(tags);
@@ -454,11 +626,15 @@ app.post('/api/scan-accessibility', async (req, res) => {
     await browser.close();
 
     console.log(`Scan completed for ${url} - Score: ${scoreData.score}/100`);
+    
+    // Save to Local DB (Cosmos DB schema)
+    const dbRecord = saveToDatabase(url, results, scoreData, { wcagLevel: tags.includes('wcag2aaa') ? 'AAA' : 'AA' });
 
     res.json({
       success: true,
       accessibility: results,
       score: scoreData,
+      databaseId: dbRecord ? dbRecord.id : null,
       scannedUrl: url,
       timestamp: new Date().toISOString(),
       scanOptions: {
@@ -471,10 +647,35 @@ app.post('/api/scan-accessibility', async (req, res) => {
     });
   } catch (error) {
     console.error('Scan error:', error);
-    res.status(500).json({ 
+    
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {
+        // Ignore close errors
+      }
+    }
+    
+    // Provide user-friendly error messages
+    let userMessage = 'An error occurred while scanning the website.';
+    let statusCode = 500;
+    
+    if (error.name === 'TimeoutError' || error.message?.includes('Timeout')) {
+      userMessage = 'The website took too long to respond. It may be blocking automated scans or experiencing high load.';
+      statusCode = 408;
+    } else if (error.message?.includes('net::ERR')) {
+      userMessage = 'Network error occurred while trying to access the website.';
+      statusCode = 502;
+    } else if (error.message?.includes('browser')) {
+      userMessage = 'Browser error occurred. Please try again.';
+    }
+    
+    res.status(statusCode).json({ 
       success: false, 
-      error: error.message,
-      scannedUrl: url
+      error: userMessage,
+      technicalError: error.message,
+      scannedUrl: url,
+      suggestion: 'If this error persists, the website may not support automated accessibility scanning.'
     });
   }
 });
@@ -483,7 +684,8 @@ app.post('/api/scan-accessibility', async (req, res) => {
 app.get('/api/rules', async (req, res) => {
   try {
     const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
+    const context = await browser.newContext();
+    const page = await context.newPage();
     
     // Get axe-core version and rules info
     const axeInfo = await page.evaluate(async () => {
@@ -567,7 +769,8 @@ app.post('/api/scan-batch', async (req, res) => {
       const batchPromises = batch.map(async (url) => {
         try {
           const browser = await chromium.launch({ headless: true });
-          const page = await browser.newPage();
+          const context = await browser.newContext();
+          const page = await context.newPage();
           await page.setViewportSize({ width: 1920, height: 1080 });
           await page.goto(url, { waitUntil: 'networkidle' });
 
@@ -590,6 +793,9 @@ app.post('/api/scan-batch', async (req, res) => {
           const scoreData = calculateAccessibilityScore(scanResults);
 
           await browser.close();
+
+          // Save to Local DB (Cosmos DB schema)
+          saveToDatabase(url, scanResults, scoreData, { wcagLevel: tags.includes('wcag2aaa') ? 'AAA' : 'AA' });
 
           return {
             url,
@@ -665,7 +871,8 @@ app.get('/api/health', async (_req, res) => {
     // Test basic browser functionality
     const startTime = Date.now();
     const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
+    const context = await browser.newContext();
+    const page = await context.newPage();
     await page.goto('data:text/html,<html><body>Health Check</body></html>');
     await browser.close();
     const browserTestTime = Date.now() - startTime;

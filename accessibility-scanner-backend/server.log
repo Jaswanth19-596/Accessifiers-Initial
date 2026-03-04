@@ -1,0 +1,10 @@
+[dotenv@17.2.3] injecting env (2) from .env -- tip: ✅ audit secrets and track compliance: https://dotenvx.com/ops
+🚀 Enhanced Accessibility Scanner API server running on port 3001
+📊 Health check: http://localhost:3001/api/health
+📋 API docs: http://localhost:3001/
+🔍 Main scan endpoint: POST http://localhost:3001/api/scan-accessibility
+📦 Batch scan endpoint: POST http://localhost:3001/api/scan-batch
+⚙️  Rules endpoint: GET http://localhost:3001/api/rules
+Calling WAVE API for: https://example.com
+WAVE scan completed for: https://example.com
+Scan completed for https://example.com - Score: 100/100
